@@ -65,14 +65,17 @@ MAX_CELL_LEN = 32000  # stay under Excel's 32,767 character cell limit
 # home_only: global (IAM) resources, listed only in the home region.
 # children: listed for each parent row; kwargs values are formatted with the
 #   parent's fields, e.g. {"application_id": "{id}"}.
+# subtype: (field, {value: type}) - split one list call into several resource
+#   types by an attribute, e.g. Autonomous Databases into ATP / ADW.
 
 
 def R(category, service, rtype, client, method, scope="comp", home_only=False,
-      kwargs=None, children=None):
+      kwargs=None, children=None, subtype=None):
     return {
         "category": category, "service": service, "type": rtype,
         "client": client, "method": method, "scope": scope,
         "home_only": home_only, "kwargs": kwargs or {}, "children": children or [],
+        "subtype": subtype,
     }
 
 
@@ -167,7 +170,14 @@ RESOURCES = [
     R("PaaS", "Database", "DB Home", "database.DatabaseClient", "list_db_homes",
       children=[C("Database", "database.DatabaseClient", "list_databases",
                   {"compartment_id": "{compartment_id}", "db_home_id": "{id}"})]),
-    R("PaaS", "Database", "Autonomous Database", "database.DatabaseClient", "list_autonomous_databases"),
+    R("PaaS", "Database", "Autonomous Database", "database.DatabaseClient", "list_autonomous_databases",
+      subtype=("db_workload", {
+          "OLTP": "Autonomous Transaction Processing (ATP)",
+          "DW": "Autonomous Data Warehouse (ADW)",
+          "AJD": "Autonomous JSON Database (AJD)",
+          "APEX": "Autonomous APEX Service",
+          "LH": "Autonomous AI Lakehouse",
+      })),
     R("PaaS", "Database", "Autonomous Container Database", "database.DatabaseClient",
       "list_autonomous_container_databases"),
     R("PaaS", "Database", "Cloud Exadata Infrastructure", "database.DatabaseClient",
@@ -202,7 +212,7 @@ RESOURCES = [
     R("PaaS", "Integration", "Integration Instance", "integration.IntegrationInstanceClient",
       "list_integration_instances"),
     R("PaaS", "Visual Builder", "Visual Builder Instance", "visual_builder.VbInstanceClient", "list_vb_instances"),
-    R("PaaS", "Analytics", "Analytics Instance", "analytics.AnalyticsClient", "list_analytics_instances"),
+    R("PaaS", "Analytics", "Oracle Analytics Cloud (OAC)", "analytics.AnalyticsClient", "list_analytics_instances"),
     R("PaaS", "Digital Assistant", "Digital Assistant Instance", "oda.OdaClient", "list_oda_instances"),
     R("PaaS", "Data Science", "Data Science Project", "data_science.DataScienceClient", "list_projects"),
     R("PaaS", "Data Science", "Notebook Session", "data_science.DataScienceClient", "list_notebook_sessions"),
@@ -421,7 +431,17 @@ def collect_task(inv: Inventory, spec, region, comp, ctx, include_deleted) -> in
             continue
         if keep(row, include_deleted):
             rows.append(row)
-    inv.add(key, rows)
+    if spec["subtype"]:
+        field, names = spec["subtype"]
+        grouped = defaultdict(list)
+        for row in rows:
+            value = row.get(f"attr.{field}") or ""
+            row["Resource Type"] = names.get(value, f"{spec['type']} ({value or 'unknown'})")
+            grouped[row["Resource Type"]].append(row)
+        for rtype, group in grouped.items():
+            inv.add((spec["category"], spec["service"], rtype), group)
+    else:
+        inv.add(key, rows)
     count = len(rows)
 
     for child in spec["children"]:

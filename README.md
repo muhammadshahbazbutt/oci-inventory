@@ -129,10 +129,11 @@ Output goes to `./output/oci_inventory_<timestamp>/`:
 Covered services include Compute, Block/File/Object Storage, Networking
 (VCN, subnets, gateways, DRG, VPN, FastConnect, LB/NLB, DNS, Network
 Firewall), WAF, Vault, Certificates, Bastion, Logging/Monitoring/
-Notifications/Events, IAM, Oracle Database (DB Systems, Exadata, Autonomous),
+Notifications/Events, IAM, Oracle Database (DB Systems, Exadata, Autonomous
+ATP / ADW / AJD / APEX as separate types),
 MySQL HeatWave, PostgreSQL, NoSQL, Redis, OpenSearch, GoldenGate, OKE,
 Container Instances, Container/Artifact Registry, Functions, API Gateway,
-Integration, Visual Builder, Analytics, Digital Assistant, Data Science,
+Integration, Visual Builder, Oracle Analytics Cloud (OAC), Digital Assistant, Data Science,
 Data Flow, Data Integration, Data Catalog, Big Data, Generative AI,
 Streaming, Queue, Email Delivery, Blockchain, APM, DevOps and Resource
 Manager. Terminated/deleted resources are skipped unless
