@@ -1,37 +1,38 @@
 #!/usr/bin/env python3
-"""OCI multi-region IaaS & PaaS inventory exporter (CSV).
+"""OCI multi-region IaaS & PaaS inventory exporter (single Excel workbook).
 
 Standalone, read-only script that walks every subscribed region and every
 accessible compartment of the tenancy and exports the resources it finds to
-CSV files. Only OCI SDK ``list_*`` / ``get_*`` calls are used; nothing is ever
-created, changed or deleted.
+ONE Excel file with a separate sheet per resource type. Only OCI SDK
+``list_*`` / ``get_*`` calls are used; nothing is ever created, changed or
+deleted.
 
 Authentication reuses your existing OCI CLI / API-key setup (``~/.oci/config``).
 
 Usage:
-    pip install oci
-    python3 oci_inventory_csv.py                       # all regions, all compartments
-    python3 oci_inventory_csv.py --profile PROD
-    python3 oci_inventory_csv.py --regions us-ashburn-1,uk-london-1
-    python3 oci_inventory_csv.py --compartment ocid1.compartment.oc1..xxxx
-    python3 oci_inventory_csv.py --output-dir ./inventory --workers 16
+    pip install oci openpyxl
+    python3 oci_inventory_excel.py                     # all regions, all compartments
+    python3 oci_inventory_excel.py --profile PROD
+    python3 oci_inventory_excel.py --regions us-ashburn-1,uk-london-1
+    python3 oci_inventory_excel.py --compartment ocid1.compartment.oc1..xxxx
+    python3 oci_inventory_excel.py --output-dir ./inventory --workers 16
 
-Output (in ``<output-dir>/oci_inventory_<timestamp>/``):
-    OCI_Inventory_All.csv        one row per resource, common columns
-    OCI_Inventory_Summary.csv    resource counts per region / service / type
-    OCI_Inventory_Errors.csv     calls that failed (permissions, service not
-                                 available in region, ...)
-    OCI_Resource_Search.csv      everything OCI Resource Search can see, as a
-                                 completeness cross-check (skip: --no-search)
-    <Category>_<Service>_<Type>.csv
-                                 one file per resource type with every
-                                 attribute returned by the API, flattened
+Output: ``<output-dir>/OCI_Inventory_<profile>_<timestamp>.xlsx`` with sheets
+    Summary           resource counts per region / service / type, with a
+                      link to each resource sheet
+    All Resources     one row per resource, common columns
+    <Resource Type>   one sheet per resource type (Instance, VCN, ATP, ADW,
+                      OAC, ...) with every attribute returned by the API
+    Resource Search   everything OCI Resource Search can see, as a
+                      completeness cross-check (skip: --no-search)
+    Errors            calls that failed (permissions, service not available
+                      in region, ...)
+    Run Info          tenancy, profile, regions scanned, timestamp, totals
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import logging
 import os
@@ -47,12 +48,20 @@ from pathlib import Path
 try:
     import oci
 except ImportError:  # pragma: no cover
-    sys.exit("The OCI Python SDK is required:  pip install oci")
+    sys.exit("The OCI Python SDK is required:  pip install oci openpyxl")
+try:
+    from openpyxl import Workbook
+    from openpyxl.cell import WriteOnlyCell
+    from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+    from openpyxl.styles import Font, PatternFill
+except ImportError:  # pragma: no cover
+    sys.exit("openpyxl is required:  pip install openpyxl")
 
 log = logging.getLogger("oci_inventory")
 
 SKIP_STATES = {"TERMINATED", "DELETED"}
 MAX_CELL_LEN = 32000  # stay under Excel's 32,767 character cell limit
+MAX_ROWS = 1_048_575  # Excel row limit minus the header row
 
 # ---------------------------------------------------------------------------
 # Resource catalogue
@@ -505,47 +514,128 @@ def resource_search(inv: Inventory, regions, comps_by_id, include_deleted) -> li
 # ---------------------------------------------------------------------------
 
 
-def clip(value):
-    if isinstance(value, str) and len(value) > MAX_CELL_LEN:
-        return value[:MAX_CELL_LEN] + "...[truncated]"
+def cell_value(value):
+    """Make a value safe for an Excel cell."""
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if not isinstance(value, (str, int, float, bool)):
+        value = str(value)
+    if isinstance(value, str):
+        value = ILLEGAL_CHARACTERS_RE.sub("", value)
+        if len(value) > MAX_CELL_LEN:
+            value = value[:MAX_CELL_LEN] + "...[truncated]"
     return value
 
 
-def write_csv(path: Path, rows: list[dict], columns: list[str]) -> None:
-    with path.open("w", newline="", encoding="utf-8-sig") as fh:
-        writer = csv.DictWriter(fh, fieldnames=columns, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({c: clip(row.get(c, "")) for c in columns})
+class SheetNamer:
+    """Excel sheet names: max 31 chars, no []:*?/\\, unique (case-insensitive)."""
+
+    def __init__(self):
+        self.used = set()
+
+    def __call__(self, text: str) -> str:
+        base = re.sub(r"[\[\]:*?/\\]", "-", text).strip("' ")[:31] or "Sheet"
+        name, n = base, 2
+        while name.lower() in self.used:
+            suffix = f" ({n})"
+            name, n = base[:31 - len(suffix)] + suffix, n + 1
+        self.used.add(name.lower())
+        return name
 
 
-def write_outputs(inv: Inventory, out_dir: Path, search_rows: list[dict] | None) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    all_rows = []
-    summary = Counter()
-    for (category, service, rtype), rows in sorted(inv.rows.items()):
-        if not rows:
-            continue
+# Resource types whose names exceed Excel's 31-character sheet-name limit.
+SHEET_ALIASES = {
+    "Autonomous Transaction Processing (ATP)": "Autonomous Transaction (ATP)",
+    "Exadata Database Service VM Cluster": "ExaDB VM Cluster",
+}
+
+HEADER_FONT = Font(bold=True, color="FFFFFF")
+HEADER_FILL = PatternFill("solid", fgColor="C74634")
+LINK_FONT = Font(color="0563C1", underline="single")
+
+
+def add_sheet(wb, title: str, rows: list[dict], columns: list[str], links: dict | None = None) -> None:
+    """Append a formatted sheet: bold coloured header, frozen top row, filter, sized columns."""
+    ws = wb.create_sheet(title)
+    if len(rows) > MAX_ROWS:
+        log.warning("Sheet '%s' has %d rows; only the first %d fit in Excel.", title, len(rows), MAX_ROWS)
+        rows = rows[:MAX_ROWS]
+    for idx, col in enumerate(columns, start=1):
+        sample = [len(str(r.get(col, ""))) for r in rows[:200]]
+        width = min(max([len(col)] + sample) + 2, 60)
+        ws.column_dimensions[_col_letter(idx)].width = width
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{_col_letter(len(columns))}{len(rows) + 1}"
+
+    header = []
+    for col in columns:
+        cell = WriteOnlyCell(ws, value=col)
+        cell.font, cell.fill = HEADER_FONT, HEADER_FILL
+        header.append(cell)
+    ws.append(header)
+    for row in rows:
+        values = []
+        for col in columns:
+            value = cell_value(row.get(col, ""))
+            if links and col in links and row.get(col) in links[col]:
+                target = links[col][row[col]].replace("'", "''")
+                cell = WriteOnlyCell(ws, value=f'=HYPERLINK("#\'{target}\'!A1","{value}")')
+                cell.font = LINK_FONT
+                value = cell
+            values.append(value)
+        ws.append(values)
+
+
+def _col_letter(n: int) -> str:
+    letters = ""
+    while n:
+        n, rem = divmod(n - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+
+def write_workbook(inv: Inventory, path: Path, search_rows: list[dict] | None, meta: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    namer = SheetNamer()
+    for reserved in ("Summary", "All Resources", "Resource Search", "Errors", "Run Info"):
+        namer(reserved)
+
+    all_rows, summary, type_sheets = [], Counter(), []
+    sheet_for_type = {}
+    order = sorted((k for k, v in inv.rows.items() if v), key=lambda k: (k[0], k[1], k[2]))
+    for category, service, rtype in order:
+        rows = inv.rows[(category, service, rtype)]
         all_rows.extend(rows)
         for r in rows:
             summary[(r["Region"], category, service, rtype)] += 1
+        sheet = namer(SHEET_ALIASES.get(rtype, rtype))
+        sheet_for_type[rtype] = sheet
         extra = sorted({k for r in rows for k in r if k.startswith("attr.")})
-        write_csv(out_dir / f"{category}_{safe_name(service)}_{safe_name(rtype)}.csv", rows, COMMON_COLUMNS + extra)
+        type_sheets.append((sheet, rows, COMMON_COLUMNS + extra))
 
-    write_csv(out_dir / "OCI_Inventory_All.csv", all_rows, COMMON_COLUMNS)
-    write_csv(
-        out_dir / "OCI_Inventory_Summary.csv",
-        [{"Region": k[0], "Category": k[1], "Service": k[2], "Resource Type": k[3], "Count": v}
-         for k, v in sorted(summary.items())],
-        ["Region", "Category", "Service", "Resource Type", "Count"],
-    )
-    write_csv(out_dir / "OCI_Inventory_Errors.csv", inv.errors,
-              ["Region", "Resource Type", "Compartment", "Status", "Code", "Message"])
+    summary_rows = [{"Region": k[0], "Category": k[1], "Service": k[2], "Resource Type": k[3], "Count": v,
+                     "Sheet": sheet_for_type[k[3]]} for k, v in sorted(summary.items())]
+    info_rows = [{"Setting": k, "Value": v} for k, v in meta.items()]
+    info_rows.append({"Setting": "Total Resources", "Value": len(all_rows)})
+    info_rows.append({"Setting": "Errors / Skipped Calls", "Value": len(inv.errors)})
+
+    wb = Workbook(write_only=True)
+    add_sheet(wb, "Summary", summary_rows,
+              ["Region", "Category", "Service", "Resource Type", "Count", "Sheet"],
+              links={"Sheet": {s: s for s in sheet_for_type.values()}})
+    add_sheet(wb, "All Resources", all_rows, COMMON_COLUMNS)
+    for sheet, rows, columns in type_sheets:
+        add_sheet(wb, sheet, rows, columns)
     if search_rows is not None:
-        write_csv(out_dir / "OCI_Resource_Search.csv", search_rows,
+        add_sheet(wb, "Resource Search", search_rows,
                   ["Region", "Resource Type", "Name", "OCID", "Lifecycle State", "Availability Domain",
                    "Compartment Name", "Compartment Path", "Time Created", "Freeform Tags", "Defined Tags"])
-    log.info("Total resources: %d   (%d resource types)", len(all_rows), sum(1 for r in inv.rows.values() if r))
+    add_sheet(wb, "Errors", inv.errors, ["Region", "Resource Type", "Compartment", "Status", "Code", "Message"])
+    add_sheet(wb, "Run Info", info_rows, ["Setting", "Value"])
+    wb.save(path)
+    log.info("Total resources: %d   (%d resource types)", len(all_rows), len(type_sheets))
 
 
 # ---------------------------------------------------------------------------
@@ -554,7 +644,7 @@ def write_outputs(inv: Inventory, out_dir: Path, search_rows: list[dict] | None)
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Export OCI IaaS & PaaS inventory for all regions to CSV (read-only).")
+    p = argparse.ArgumentParser(description="Export OCI IaaS & PaaS inventory for all regions to one Excel workbook (read-only).")
     p.add_argument("--config-file", default=os.getenv("OCI_CLI_CONFIG_FILE", oci.config.DEFAULT_LOCATION),
                    help="OCI config file (default: ~/.oci/config)")
     p.add_argument("--profile", default=os.getenv("OCI_CLI_PROFILE", "DEFAULT"), help="OCI config profile")
@@ -563,7 +653,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", default="./output", help="Base output directory (default: ./output)")
     p.add_argument("--workers", type=int, default=10, help="Parallel API workers (default: 10)")
     p.add_argument("--include-deleted", action="store_true", help="Also export TERMINATED/DELETED resources")
-    p.add_argument("--no-search", action="store_true", help="Skip the OCI Resource Search cross-check CSV")
+    p.add_argument("--no-search", action="store_true", help="Skip the OCI Resource Search cross-check sheet")
     p.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
     return p.parse_args()
 
@@ -631,10 +721,16 @@ def main() -> None:
         comps_by_id = {c["id"]: c for c in comps}
         search_rows = resource_search(inv, regions, comps_by_id, args.include_deleted)
 
-    out_dir = Path(args.output_dir) / f"oci_inventory_{datetime.now():%Y%m%d_%H%M%S}"
-    write_outputs(inv, out_dir, search_rows)
-    log.info("Errors / skipped calls: %d (see OCI_Inventory_Errors.csv)", len(inv.errors))
-    log.info("CSV files written to: %s", out_dir.resolve())
+    started_at = datetime.now()
+    path = Path(args.output_dir) / f"OCI_Inventory_{safe_name(args.profile)}_{started_at:%Y%m%d_%H%M%S}.xlsx"
+    meta = {
+        "Tenancy": tenancy_id, "Profile": args.profile, "Home Region": home,
+        "Regions Scanned": ", ".join(regions), "Compartments Scanned": len(comps),
+        "Generated": f"{started_at:%Y-%m-%d %H:%M:%S}",
+    }
+    write_workbook(inv, path, search_rows, meta)
+    log.info("Errors / skipped calls: %d (see the 'Errors' sheet)", len(inv.errors))
+    log.info("Excel workbook written to: %s", path.resolve())
 
 
 if __name__ == "__main__":

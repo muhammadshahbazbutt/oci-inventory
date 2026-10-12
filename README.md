@@ -100,31 +100,36 @@ Additional overrides:
 - `OCI_CLI_PROFILE` / `OCI_PROFILE` — profile name in `~/.oci/config`
 - `OCI_CONFIG_FILE` — alternate path to the OCI config file
 
-## Multi-region CSV export (`oci_inventory_csv.py`)
+## Multi-region Excel export (`oci_inventory_excel.py`)
 
 A standalone script that inventories **all subscribed regions** and **all
-accessible compartments** (IaaS and PaaS services) and writes CSV files.
-It only needs the `oci` package and your existing OCI CLI / API-key config.
+accessible compartments** (IaaS and PaaS services) and writes **one Excel
+workbook** with a separate sheet per resource type. It only needs `oci` and
+`openpyxl`, plus your existing OCI CLI / API-key config.
 
 ```bash
-pip install oci
-python3 oci_inventory_csv.py                                  # everything
-python3 oci_inventory_csv.py --profile PROD --workers 16
-python3 oci_inventory_csv.py --regions us-ashburn-1,uk-london-1
-python3 oci_inventory_csv.py --compartment ocid1.compartment.oc1..<id>
+pip install oci openpyxl
+python3 oci_inventory_excel.py                                # everything
+python3 oci_inventory_excel.py --profile PROD --workers 16
+python3 oci_inventory_excel.py --regions us-ashburn-1,uk-london-1
+python3 oci_inventory_excel.py --compartment ocid1.compartment.oc1..<id>
 ```
 
-Output goes to `./output/oci_inventory_<timestamp>/`:
+Output: `./output/OCI_Inventory_<profile>_<timestamp>.xlsx` with sheets:
 
-- `OCI_Inventory_All.csv` — every resource, common columns (region, service,
-  type, compartment path, name, OCID, state, shape, tags, ...)
-- `<Category>_<Service>_<Type>.csv` — one file per resource type with all
+- `Summary` — counts per region / service / type, with a link to each sheet
+- `All Resources` — every resource, common columns (region, service, type,
+  compartment path, name, OCID, state, shape, tags, ...)
+- one sheet per resource type (Instance, VCN, ATP, ADW, OAC, ...) with all
   API attributes flattened into columns
-- `OCI_Inventory_Summary.csv` — counts per region / service / type
-- `OCI_Inventory_Errors.csv` — calls that failed (missing permissions,
-  service not available in a region, ...)
-- `OCI_Resource_Search.csv` — OCI Resource Search cross-check
+- `Resource Search` — OCI Resource Search cross-check
   (disable with `--no-search`)
+- `Errors` — calls that failed (missing permissions, service not available
+  in a region, ...)
+- `Run Info` — tenancy, profile, regions scanned, timestamp and totals
+
+Every sheet has a bold header row, frozen panes, auto filter and sized
+columns.
 
 Covered services include Compute, Block/File/Object Storage, Networking
 (VCN, subnets, gateways, DRG, VPN, FastConnect, LB/NLB, DNS, Network
