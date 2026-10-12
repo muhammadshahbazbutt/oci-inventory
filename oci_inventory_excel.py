@@ -1,32 +1,33 @@
 #!/usr/bin/env python3
-"""OCI multi-region IaaS & PaaS inventory exporter (single Excel workbook).
+"""OCI provisioned-resource inventory (IaaS & PaaS) -> single Excel workbook.
 
 Standalone, read-only script that walks every subscribed region and every
-accessible compartment of the tenancy and exports the resources it finds to
-ONE Excel file with a separate sheet per resource type. Only OCI SDK
-``list_*`` / ``get_*`` calls are used; nothing is ever created, changed or
-deleted.
+accessible compartment of the tenancy and lists the resources that are
+actually PROVISIONED - running, stopped / powered off, or being created.
+Terminated, deleted and failed resources are left out, and so are
+configuration objects (route tables, security lists, attachments, IAM
+policies, users, alarms, ...). Each sheet holds only the key columns for
+that resource type (name, status, shape, OCPUs, memory, storage, version).
 
-Authentication reuses your existing OCI CLI / API-key setup (``~/.oci/config``).
+Only OCI SDK ``list_*`` / ``get_*`` calls are used; nothing is ever created,
+changed or deleted. Authentication reuses your OCI CLI / API-key setup
+(``~/.oci/config``).
 
 Usage:
     pip install oci openpyxl
-    python3 oci_inventory_excel.py                     # all regions, all compartments
-    python3 oci_inventory_excel.py --profile PROD
+    python3 oci_inventory_excel.py --profile TanencyB
     python3 oci_inventory_excel.py --regions us-ashburn-1,uk-london-1
     python3 oci_inventory_excel.py --compartment ocid1.compartment.oc1..xxxx
-    python3 oci_inventory_excel.py --output-dir ./inventory --workers 16
+    python3 oci_inventory_excel.py --tags              # add tag columns
 
 Output: ``<output-dir>/OCI_Inventory_<profile>_<timestamp>.xlsx`` with sheets
-    Summary           resource counts per region / service / type, with a
-                      link to each resource sheet
-    All Resources     one row per resource, common columns
-    <Resource Type>   one sheet per resource type (Instance, VCN, ATP, ADW,
-                      OAC, ...) with every attribute returned by the API
-    Resource Search   everything OCI Resource Search can see, as a
-                      completeness cross-check (skip: --no-search)
-    Errors            calls that failed (permissions, service not available
-                      in region, ...)
+    Summary           resource count per resource type and region, with a
+                      link to each sheet
+    All Resources     every provisioned resource, one row each
+    <Resource Type>   one sheet per resource type (Instance, Block Volume,
+                      VCN, ATP, ADW, OAC, OKE Cluster, ...)
+    Errors            API calls that failed (missing permissions, service
+                      not available in a region, ...)
     Run Info          tenancy, profile, regions scanned, timestamp, totals
 """
 
@@ -59,128 +60,98 @@ except ImportError:  # pragma: no cover
 
 log = logging.getLogger("oci_inventory")
 
-SKIP_STATES = {"TERMINATED", "DELETED"}
+# Not provisioned: gone, going away, or never created successfully.
+SKIP_STATES = {"TERMINATED", "TERMINATING", "DELETED", "DELETING", "FAILED"}
 MAX_CELL_LEN = 32000  # stay under Excel's 32,767 character cell limit
 MAX_ROWS = 1_048_575  # Excel row limit minus the header row
 
 # ---------------------------------------------------------------------------
-# Resource catalogue
+# Resource catalogue - provisioned resources only
 # ---------------------------------------------------------------------------
 # scope:
 #   comp    list_x(compartment_id=<compartment>)
 #   ad      list_x(compartment_id=<compartment>, availability_domain=<ad>) per AD
 #   ns      list_x(namespace_name=<ns>, compartment_id=<compartment>)
-#   tenancy list_x(compartment_id=<tenancy>) once (root only)
-# home_only: global (IAM) resources, listed only in the home region.
-# children: listed for each parent row; kwargs values are formatted with the
-#   parent's fields, e.g. {"application_id": "{id}"}.
-# subtype: (field, {value: type}) - split one list call into several resource
-#   types by an attribute, e.g. Autonomous Databases into ATP / ADW.
+# fields:  extra columns for the resource's sheet, as (column, attribute path).
+#          A path is dotted for nested values ("shape_config.ocpus").
+# subtype: (attribute, {value: type}) - split one list call into several
+#          resource types by an attribute, e.g. Autonomous Databases into ATP/ADW.
 
 
-def R(category, service, rtype, client, method, scope="comp", home_only=False,
-      kwargs=None, children=None, subtype=None):
+def R(category, service, rtype, client, method, fields=(), scope="comp", kwargs=None, subtype=None):
     return {
-        "category": category, "service": service, "type": rtype,
-        "client": client, "method": method, "scope": scope,
-        "home_only": home_only, "kwargs": kwargs or {}, "children": children or [],
-        "subtype": subtype,
+        "category": category, "service": service, "type": rtype, "client": client, "method": method,
+        "fields": list(fields), "scope": scope, "kwargs": kwargs or {}, "subtype": subtype,
     }
 
 
-def C(rtype, client, method, kwargs):
-    """Child resource listed once per parent row."""
-    return {"type": rtype, "client": client, "method": method, "kwargs": kwargs}
-
+ADB_FIELDS = [
+    ("Compute Model", "compute_model"), ("ECPU/OCPU Count", "compute_count"),
+    ("Storage (TB)", "data_storage_size_in_tbs"), ("Auto Scaling", "is_auto_scaling_enabled"),
+    ("DB Version", "db_version"), ("License", "license_model"), ("Always Free", "is_free_tier"),
+    ("Dedicated", "is_dedicated"),
+]
 
 RESOURCES = [
     # ----------------------------- IaaS ----------------------------------
-    # Compute
-    R("IaaS", "Compute", "Instance", "core.ComputeClient", "list_instances"),
-    R("IaaS", "Compute", "Custom Image", "core.ComputeClient", "list_images"),
-    R("IaaS", "Compute", "Dedicated VM Host", "core.ComputeClient", "list_dedicated_vm_hosts"),
-    R("IaaS", "Compute", "Capacity Reservation", "core.ComputeClient", "list_compute_capacity_reservations"),
-    R("IaaS", "Compute", "VNIC Attachment", "core.ComputeClient", "list_vnic_attachments"),
-    R("IaaS", "Compute", "Volume Attachment", "core.ComputeClient", "list_volume_attachments"),
-    R("IaaS", "Compute", "Boot Volume Attachment", "core.ComputeClient", "list_boot_volume_attachments", scope="ad"),
-    R("IaaS", "Compute", "Instance Configuration", "core.ComputeManagementClient", "list_instance_configurations"),
-    R("IaaS", "Compute", "Instance Pool", "core.ComputeManagementClient", "list_instance_pools"),
+    R("IaaS", "Compute", "Instance", "core.ComputeClient", "list_instances",
+      [("OCPUs", "shape_config.ocpus"), ("Memory (GB)", "shape_config.memory_in_gbs"),
+       ("Fault Domain", "fault_domain")]),
+    R("IaaS", "Compute", "Dedicated VM Host", "core.ComputeClient", "list_dedicated_vm_hosts",
+      [("Total OCPUs", "total_ocpus"), ("Total Memory (GB)", "total_memory_in_gbs")]),
+    R("IaaS", "Compute", "Instance Pool", "core.ComputeManagementClient", "list_instance_pools",
+      [("Pool Size", "size")]),
     R("IaaS", "Compute", "Cluster Network", "core.ComputeManagementClient", "list_cluster_networks"),
-    R("IaaS", "Compute", "Autoscaling Configuration", "autoscaling.AutoScalingClient", "list_auto_scaling_configurations"),
-    # Block storage
-    R("IaaS", "Block Storage", "Block Volume", "core.BlockstorageClient", "list_volumes"),
-    R("IaaS", "Block Storage", "Boot Volume", "core.BlockstorageClient", "list_boot_volumes"),
-    R("IaaS", "Block Storage", "Volume Backup", "core.BlockstorageClient", "list_volume_backups"),
-    R("IaaS", "Block Storage", "Boot Volume Backup", "core.BlockstorageClient", "list_boot_volume_backups"),
-    R("IaaS", "Block Storage", "Volume Group", "core.BlockstorageClient", "list_volume_groups"),
-    R("IaaS", "Block Storage", "Volume Group Backup", "core.BlockstorageClient", "list_volume_group_backups"),
-    R("IaaS", "Block Storage", "Backup Policy", "core.BlockstorageClient", "list_volume_backup_policies"),
-    # File & object storage
-    R("IaaS", "File Storage", "File System", "file_storage.FileStorageClient", "list_file_systems", scope="ad"),
+    R("IaaS", "Block Storage", "Block Volume", "core.BlockstorageClient", "list_volumes",
+      [("Size (GB)", "size_in_gbs"), ("VPUs per GB", "vpus_per_gb")]),
+    R("IaaS", "Block Storage", "Boot Volume", "core.BlockstorageClient", "list_boot_volumes",
+      [("Size (GB)", "size_in_gbs"), ("VPUs per GB", "vpus_per_gb")]),
+    R("IaaS", "Block Storage", "Volume Group", "core.BlockstorageClient", "list_volume_groups",
+      [("Size (GB)", "size_in_gbs")]),
+    R("IaaS", "File Storage", "File System", "file_storage.FileStorageClient", "list_file_systems",
+      [("Used (Bytes)", "metered_bytes")], scope="ad"),
     R("IaaS", "File Storage", "Mount Target", "file_storage.FileStorageClient", "list_mount_targets", scope="ad"),
-    R("IaaS", "File Storage", "Export Set", "file_storage.FileStorageClient", "list_export_sets", scope="ad"),
-    R("IaaS", "Object Storage", "Bucket", "object_storage.ObjectStorageClient", "list_buckets", scope="ns",
-      kwargs={"fields": ["tags"]}),
-    # Networking
-    R("IaaS", "Networking", "VCN", "core.VirtualNetworkClient", "list_vcns"),
-    R("IaaS", "Networking", "Subnet", "core.VirtualNetworkClient", "list_subnets"),
-    R("IaaS", "Networking", "Route Table", "core.VirtualNetworkClient", "list_route_tables"),
-    R("IaaS", "Networking", "Security List", "core.VirtualNetworkClient", "list_security_lists"),
-    R("IaaS", "Networking", "Network Security Group", "core.VirtualNetworkClient", "list_network_security_groups",
-      children=[C("NSG Security Rule", "core.VirtualNetworkClient", "list_network_security_group_security_rules",
-                  {"network_security_group_id": "{id}"})]),
-    R("IaaS", "Networking", "DHCP Options", "core.VirtualNetworkClient", "list_dhcp_options"),
+    R("IaaS", "Object Storage", "Bucket", "object_storage.ObjectStorageClient", "list_buckets", scope="ns"),
+    R("IaaS", "Networking", "VCN", "core.VirtualNetworkClient", "list_vcns",
+      [("CIDR Blocks", "cidr_blocks"), ("DNS Label", "dns_label")]),
+    R("IaaS", "Networking", "Subnet", "core.VirtualNetworkClient", "list_subnets",
+      [("CIDR Block", "cidr_block"), ("Private Subnet", "prohibit_public_ip_on_vnic")]),
     R("IaaS", "Networking", "Internet Gateway", "core.VirtualNetworkClient", "list_internet_gateways"),
-    R("IaaS", "Networking", "NAT Gateway", "core.VirtualNetworkClient", "list_nat_gateways"),
+    R("IaaS", "Networking", "NAT Gateway", "core.VirtualNetworkClient", "list_nat_gateways",
+      [("NAT IP", "nat_ip")]),
     R("IaaS", "Networking", "Service Gateway", "core.VirtualNetworkClient", "list_service_gateways"),
-    R("IaaS", "Networking", "Local Peering Gateway", "core.VirtualNetworkClient", "list_local_peering_gateways"),
+    R("IaaS", "Networking", "Local Peering Gateway", "core.VirtualNetworkClient", "list_local_peering_gateways",
+      [("Peering Status", "peering_status")]),
     R("IaaS", "Networking", "DRG", "core.VirtualNetworkClient", "list_drgs"),
-    R("IaaS", "Networking", "DRG Attachment", "core.VirtualNetworkClient", "list_drg_attachments"),
-    R("IaaS", "Networking", "Remote Peering Connection", "core.VirtualNetworkClient", "list_remote_peering_connections"),
+    R("IaaS", "Networking", "Remote Peering Connection", "core.VirtualNetworkClient",
+      "list_remote_peering_connections", [("Peering Status", "peering_status")]),
     R("IaaS", "Networking", "Reserved Public IP", "core.VirtualNetworkClient", "list_public_ips",
+      [("IP Address", "ip_address"), ("Assigned To", "assigned_entity_type")],
       kwargs={"scope": "REGION", "lifetime": "RESERVED"}),
-    R("IaaS", "Networking", "CPE", "core.VirtualNetworkClient", "list_cpes"),
-    R("IaaS", "Networking", "IPSec Connection", "core.VirtualNetworkClient", "list_ip_sec_connections"),
-    R("IaaS", "Networking", "FastConnect Virtual Circuit", "core.VirtualNetworkClient", "list_virtual_circuits"),
-    R("IaaS", "Networking", "FastConnect Cross Connect", "core.VirtualNetworkClient", "list_cross_connects"),
-    R("IaaS", "Networking", "Load Balancer", "load_balancer.LoadBalancerClient", "list_load_balancers"),
+    R("IaaS", "Networking", "Site-to-Site VPN", "core.VirtualNetworkClient", "list_ip_sec_connections",
+      [("Static Routes", "static_routes")]),
+    R("IaaS", "Networking", "FastConnect Virtual Circuit", "core.VirtualNetworkClient", "list_virtual_circuits",
+      [("Bandwidth", "bandwidth_shape_name"), ("Type", "type"), ("Provider State", "provider_state")]),
+    R("IaaS", "Networking", "Load Balancer", "load_balancer.LoadBalancerClient", "list_load_balancers",
+      [("IP Addresses", "ip_addresses.ip_address"), ("Private", "is_private"),
+       ("Min Bandwidth (Mbps)", "shape_details.minimum_bandwidth_in_mbps"),
+       ("Max Bandwidth (Mbps)", "shape_details.maximum_bandwidth_in_mbps")]),
     R("IaaS", "Networking", "Network Load Balancer", "network_load_balancer.NetworkLoadBalancerClient",
-      "list_network_load_balancers"),
-    R("IaaS", "Networking", "DNS Zone", "dns.DnsClient", "list_zones"),
-    R("IaaS", "Networking", "DNS Steering Policy", "dns.DnsClient", "list_steering_policies"),
-    R("IaaS", "Networking", "Network Firewall", "network_firewall.NetworkFirewallClient", "list_network_firewalls"),
-    R("IaaS", "Networking", "Network Firewall Policy", "network_firewall.NetworkFirewallClient",
-      "list_network_firewall_policies"),
-    # Security
-    R("IaaS", "Security", "WAF Web App Firewall", "waf.WafClient", "list_web_app_firewalls"),
-    R("IaaS", "Security", "WAF Policy", "waf.WafClient", "list_web_app_firewall_policies"),
-    R("IaaS", "Security", "Vault", "key_management.KmsVaultClient", "list_vaults"),
-    R("IaaS", "Security", "Secret", "vault.VaultsClient", "list_secrets"),
-    R("IaaS", "Security", "Certificate", "certificates_management.CertificatesManagementClient", "list_certificates"),
-    R("IaaS", "Security", "Bastion", "bastion.BastionClient", "list_bastions"),
-    # Observability & management
-    R("IaaS", "Observability", "Log Group", "logging.LoggingManagementClient", "list_log_groups"),
-    R("IaaS", "Observability", "Alarm", "monitoring.MonitoringClient", "list_alarms"),
-    R("IaaS", "Observability", "Notification Topic", "ons.NotificationControlPlaneClient", "list_topics"),
-    R("IaaS", "Observability", "Event Rule", "events.EventsClient", "list_rules"),
-    # Identity (global - home region only)
-    R("IaaS", "Identity", "Compartment", "identity.IdentityClient", "list_compartments", home_only=True),
-    R("IaaS", "Identity", "Policy", "identity.IdentityClient", "list_policies", home_only=True),
-    R("IaaS", "Identity", "Tag Namespace", "identity.IdentityClient", "list_tag_namespaces", home_only=True),
-    R("IaaS", "Identity", "Identity Domain", "identity.IdentityClient", "list_domains", home_only=True),
-    R("IaaS", "Identity", "User", "identity.IdentityClient", "list_users", scope="tenancy", home_only=True),
-    R("IaaS", "Identity", "Group", "identity.IdentityClient", "list_groups", scope="tenancy", home_only=True),
-    R("IaaS", "Identity", "Dynamic Group", "identity.IdentityClient", "list_dynamic_groups", scope="tenancy",
-      home_only=True),
+      "list_network_load_balancers", [("IP Addresses", "ip_addresses.ip_address"), ("Private", "is_private")]),
+    R("IaaS", "Networking", "DNS Zone", "dns.DnsClient", "list_zones", [("Zone Type", "zone_type")]),
+    R("IaaS", "Networking", "Network Firewall", "network_firewall.NetworkFirewallClient", "list_network_firewalls",
+      [("IP Address", "ipv4_address")]),
+    R("IaaS", "Security", "Web App Firewall", "waf.WafClient", "list_web_app_firewalls",
+      [("Backend Type", "backend_type")]),
+    R("IaaS", "Security", "Vault", "key_management.KmsVaultClient", "list_vaults", [("Vault Type", "vault_type")]),
+    R("IaaS", "Security", "Bastion", "bastion.BastionClient", "list_bastions", [("Bastion Type", "bastion_type")]),
 
     # ----------------------------- PaaS ----------------------------------
-    # Oracle Database
-    R("PaaS", "Database", "DB System", "database.DatabaseClient", "list_db_systems"),
-    R("PaaS", "Database", "DB Home", "database.DatabaseClient", "list_db_homes",
-      children=[C("Database", "database.DatabaseClient", "list_databases",
-                  {"compartment_id": "{compartment_id}", "db_home_id": "{id}"})]),
+    R("PaaS", "Database", "DB System", "database.DatabaseClient", "list_db_systems",
+      [("CPU Cores", "cpu_core_count"), ("Nodes", "node_count"), ("Storage (GB)", "data_storage_size_in_gbs"),
+       ("Edition", "database_edition"), ("Version", "version"), ("License", "license_model")]),
     R("PaaS", "Database", "Autonomous Database", "database.DatabaseClient", "list_autonomous_databases",
-      subtype=("db_workload", {
+      ADB_FIELDS, subtype=("db_workload", {
           "OLTP": "Autonomous Transaction Processing (ATP)",
           "DW": "Autonomous Data Warehouse (ADW)",
           "AJD": "Autonomous JSON Database (AJD)",
@@ -188,69 +159,84 @@ RESOURCES = [
           "LH": "Autonomous AI Lakehouse",
       })),
     R("PaaS", "Database", "Autonomous Container Database", "database.DatabaseClient",
-      "list_autonomous_container_databases"),
+      "list_autonomous_container_databases", [("Version", "db_version")]),
     R("PaaS", "Database", "Cloud Exadata Infrastructure", "database.DatabaseClient",
-      "list_cloud_exadata_infrastructures"),
-    R("PaaS", "Database", "Cloud VM Cluster", "database.DatabaseClient", "list_cloud_vm_clusters"),
-    R("PaaS", "Database", "Cloud Autonomous VM Cluster", "database.DatabaseClient",
-      "list_cloud_autonomous_vm_clusters"),
-    R("PaaS", "Database", "Exadata Database Service VM Cluster", "database.DatabaseClient", "list_exadb_vm_clusters"),
-    R("PaaS", "MySQL HeatWave", "MySQL DB System", "mysql.DbSystemClient", "list_db_systems"),
-    R("PaaS", "MySQL HeatWave", "MySQL Backup", "mysql.DbBackupsClient", "list_backups"),
-    R("PaaS", "PostgreSQL", "PostgreSQL DB System", "psql.PostgresqlClient", "list_db_systems"),
-    R("PaaS", "NoSQL", "NoSQL Table", "nosql.NosqlClient", "list_tables"),
-    R("PaaS", "Cache", "Redis Cluster", "redis.RedisClusterClient", "list_redis_clusters"),
-    R("PaaS", "Search", "OpenSearch Cluster", "opensearch.OpensearchClusterClient", "list_opensearch_clusters"),
-    R("PaaS", "GoldenGate", "GoldenGate Deployment", "golden_gate.GoldenGateClient", "list_deployments"),
-    # Containers & serverless
-    R("PaaS", "Kubernetes (OKE)", "OKE Cluster", "container_engine.ContainerEngineClient", "list_clusters"),
-    R("PaaS", "Kubernetes (OKE)", "OKE Node Pool", "container_engine.ContainerEngineClient", "list_node_pools"),
+      "list_cloud_exadata_infrastructures",
+      [("DB Servers", "compute_count"), ("Storage Servers", "storage_count")]),
+    R("PaaS", "Database", "Exadata VM Cluster", "database.DatabaseClient", "list_cloud_vm_clusters",
+      [("CPU Cores", "cpu_core_count"), ("Nodes", "node_count"), ("GI Version", "gi_version"),
+       ("License", "license_model")]),
+    R("PaaS", "Database", "Autonomous Exadata VM Cluster", "database.DatabaseClient",
+      "list_cloud_autonomous_vm_clusters", [("CPU Cores", "cpu_core_count"), ("Nodes", "node_count")]),
+    R("PaaS", "Database", "ExaDB-XS VM Cluster", "database.DatabaseClient", "list_exadb_vm_clusters",
+      [("Nodes", "node_count"), ("ECPUs", "enabled_e_cpu_count"), ("License", "license_model")]),
+    R("PaaS", "MySQL HeatWave", "MySQL DB System", "mysql.DbSystemClient", "list_db_systems",
+      [("Version", "mysql_version"), ("HeatWave Attached", "is_heat_wave_cluster_attached")]),
+    R("PaaS", "PostgreSQL", "PostgreSQL DB System", "psql.PostgresqlClient", "list_db_systems",
+      [("Nodes", "instance_count"), ("OCPUs", "instance_ocpu_count"),
+       ("Memory (GB)", "instance_memory_size_in_gbs"), ("Version", "db_version")]),
+    R("PaaS", "NoSQL", "NoSQL Table", "nosql.NosqlClient", "list_tables",
+      [("Max Reads/s", "table_limits.max_read_units"), ("Max Writes/s", "table_limits.max_write_units"),
+       ("Max Storage (GB)", "table_limits.max_storage_in_g_bs"), ("Capacity Mode", "table_limits.capacity_mode")]),
+    R("PaaS", "Cache", "Redis Cluster", "redis.RedisClusterClient", "list_redis_clusters",
+      [("Nodes", "node_count"), ("Memory per Node (GB)", "node_memory_in_gbs"), ("Version", "software_version")]),
+    R("PaaS", "Search", "OpenSearch Cluster", "opensearch.OpensearchClusterClient", "list_opensearch_clusters",
+      [("Version", "software_version")]),
+    R("PaaS", "GoldenGate", "GoldenGate Deployment", "golden_gate.GoldenGateClient", "list_deployments",
+      [("Deployment Type", "deployment_type"), ("CPU Cores", "cpu_core_count"),
+       ("Auto Scaling", "is_auto_scaling_enabled"), ("License", "license_model")]),
+    R("PaaS", "Kubernetes (OKE)", "OKE Cluster", "container_engine.ContainerEngineClient", "list_clusters",
+      [("Kubernetes Version", "kubernetes_version"), ("Cluster Type", "type")]),
+    R("PaaS", "Kubernetes (OKE)", "OKE Node Pool", "container_engine.ContainerEngineClient", "list_node_pools",
+      [("Nodes", "node_config_details.size"), ("OCPUs per Node", "node_shape_config.ocpus"),
+       ("Memory per Node (GB)", "node_shape_config.memory_in_gbs"), ("Kubernetes Version", "kubernetes_version")]),
     R("PaaS", "Kubernetes (OKE)", "OKE Virtual Node Pool", "container_engine.ContainerEngineClient",
-      "list_virtual_node_pools"),
+      "list_virtual_node_pools", [("Nodes", "size"), ("Kubernetes Version", "kubernetes_version")]),
     R("PaaS", "Container Instances", "Container Instance", "container_instances.ContainerInstanceClient",
-      "list_container_instances"),
-    R("PaaS", "Container Registry", "Container Repository", "artifacts.ArtifactsClient",
-      "list_container_repositories"),
-    R("PaaS", "Artifact Registry", "Artifact Repository", "artifacts.ArtifactsClient", "list_repositories"),
-    R("PaaS", "Functions", "Functions Application", "functions.FunctionsManagementClient", "list_applications",
-      children=[C("Function", "functions.FunctionsManagementClient", "list_functions",
-                  {"application_id": "{id}"})]),
-    R("PaaS", "API Gateway", "API Gateway", "apigateway.GatewayClient", "list_gateways"),
-    R("PaaS", "API Gateway", "API Deployment", "apigateway.DeploymentClient", "list_deployments"),
-    # Integration, analytics & AI
+      "list_container_instances",
+      [("OCPUs", "shape_config.ocpus"), ("Memory (GB)", "shape_config.memory_in_gbs"),
+       ("Containers", "container_count")]),
+    R("PaaS", "Functions", "Functions Application", "functions.FunctionsManagementClient", "list_applications"),
+    R("PaaS", "API Gateway", "API Gateway", "apigateway.GatewayClient", "list_gateways",
+      [("Endpoint Type", "endpoint_type"), ("Hostname", "hostname")]),
     R("PaaS", "Integration", "Integration Instance", "integration.IntegrationInstanceClient",
-      "list_integration_instances"),
-    R("PaaS", "Visual Builder", "Visual Builder Instance", "visual_builder.VbInstanceClient", "list_vb_instances"),
-    R("PaaS", "Analytics", "Oracle Analytics Cloud (OAC)", "analytics.AnalyticsClient", "list_analytics_instances"),
-    R("PaaS", "Digital Assistant", "Digital Assistant Instance", "oda.OdaClient", "list_oda_instances"),
-    R("PaaS", "Data Science", "Data Science Project", "data_science.DataScienceClient", "list_projects"),
+      "list_integration_instances",
+      [("Edition", "integration_instance_type"), ("Message Packs", "message_packs"), ("BYOL", "is_byol")]),
+    R("PaaS", "Visual Builder", "Visual Builder Instance", "visual_builder.VbInstanceClient", "list_vb_instances",
+      [("Nodes", "node_count")]),
+    R("PaaS", "Analytics", "Oracle Analytics Cloud (OAC)", "analytics.AnalyticsClient", "list_analytics_instances",
+      [("Edition", "feature_set"), ("Capacity Type", "capacity.capacity_type"),
+       ("Capacity", "capacity.capacity_value"), ("License", "license_type")]),
+    R("PaaS", "Digital Assistant", "Digital Assistant Instance", "oda.OdaClient", "list_oda_instances",
+      [("Size", "shape_name")]),
     R("PaaS", "Data Science", "Notebook Session", "data_science.DataScienceClient", "list_notebook_sessions"),
     R("PaaS", "Data Science", "Model Deployment", "data_science.DataScienceClient", "list_model_deployments"),
-    R("PaaS", "Data Flow", "Data Flow Application", "data_flow.DataFlowClient", "list_applications"),
+    R("PaaS", "Data Flow", "Data Flow Application", "data_flow.DataFlowClient", "list_applications",
+      [("Language", "language"), ("Spark Version", "spark_version"), ("Type", "type")]),
     R("PaaS", "Data Integration", "Data Integration Workspace", "data_integration.DataIntegrationClient",
       "list_workspaces"),
     R("PaaS", "Data Catalog", "Data Catalog", "data_catalog.DataCatalogClient", "list_catalogs"),
-    R("PaaS", "Big Data", "Big Data Service Cluster", "bds.BdsClient", "list_bds_instances"),
-    R("PaaS", "Generative AI", "Dedicated AI Cluster", "generative_ai.GenerativeAiClient",
-      "list_dedicated_ai_clusters"),
-    R("PaaS", "Generative AI", "Generative AI Endpoint", "generative_ai.GenerativeAiClient", "list_endpoints"),
-    # Messaging & application services
-    R("PaaS", "Streaming", "Stream Pool", "streaming.StreamAdminClient", "list_stream_pools"),
-    R("PaaS", "Streaming", "Stream", "streaming.StreamAdminClient", "list_streams"),
+    R("PaaS", "Big Data", "Big Data Service Cluster", "bds.BdsClient", "list_bds_instances",
+      [("Nodes", "number_of_nodes"), ("Version", "cluster_version"), ("High Availability", "is_high_availability")]),
+    R("PaaS", "Generative AI", "GenAI Dedicated AI Cluster", "generative_ai.GenerativeAiClient",
+      "list_dedicated_ai_clusters", [("Cluster Type", "type"), ("Units", "unit_count"), ("Unit Shape", "unit_shape")]),
+    R("PaaS", "Generative AI", "GenAI Endpoint", "generative_ai.GenerativeAiClient", "list_endpoints"),
+    R("PaaS", "Generative AI", "GenAI Agent", "generative_ai_agent.GenerativeAiAgentClient", "list_agents"),
+    R("PaaS", "Generative AI", "GenAI Agent Endpoint", "generative_ai_agent.GenerativeAiAgentClient",
+      "list_agent_endpoints"),
+    R("PaaS", "Generative AI", "GenAI Knowledge Base", "generative_ai_agent.GenerativeAiAgentClient",
+      "list_knowledge_bases"),
+    R("PaaS", "Streaming", "Stream", "streaming.StreamAdminClient", "list_streams", [("Partitions", "partitions")]),
     R("PaaS", "Queue", "Queue", "queue.QueueAdminClient", "list_queues"),
-    R("PaaS", "Email Delivery", "Approved Sender", "email.EmailClient", "list_senders"),
     R("PaaS", "Blockchain", "Blockchain Platform", "blockchain.BlockchainPlatformClient",
-      "list_blockchain_platforms"),
-    R("PaaS", "APM", "APM Domain", "apm_control_plane.ApmDomainClient", "list_apm_domains"),
-    R("PaaS", "DevOps", "DevOps Project", "devops.DevopsClient", "list_projects"),
-    R("PaaS", "Resource Manager", "Resource Manager Stack", "resource_manager.ResourceManagerClient", "list_stacks"),
+      "list_blockchain_platforms", [("Platform Role", "platform_role")]),
+    R("PaaS", "APM", "APM Domain", "apm_control_plane.ApmDomainClient", "list_apm_domains",
+      [("Always Free", "is_free_tier")]),
 ]
 
-COMMON_COLUMNS = [
-    "Region", "Category", "Service", "Resource Type", "Compartment Name", "Compartment Path",
-    "Name", "OCID", "Lifecycle State", "Availability Domain", "Shape", "Time Created",
-    "Parent OCID", "Freeform Tags", "Defined Tags",
-]
+BASE_COLUMNS = ["Region", "Compartment", "Service", "Resource Type", "Name", "Status", "Shape",
+                "Availability Domain", "Created", "OCID"]
+TAG_COLUMNS = ["Freeform Tags", "Defined Tags"]
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -264,6 +250,7 @@ class Inventory:
         self.config = config
         self.timeout = timeout
         self.rows: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
+        self.fields: dict[tuple[str, str, str], list[str]] = {}
         self.errors: list[dict] = []
         self._lock = threading.Lock()
         self._local = threading.local()
@@ -280,9 +267,10 @@ class Inventory:
             cache[key] = cls(cfg, retry_strategy=oci.retry.DEFAULT_RETRY_STRATEGY, timeout=self.timeout)
         return cache[key]
 
-    def add(self, key, rows):
+    def add(self, key, rows, fields):
         with self._lock:
             self.rows[key].extend(rows)
+            self.fields[key] = fields
 
     def error(self, region, spec_type, compartment, exc):
         status = getattr(exc, "status", "")
@@ -300,57 +288,59 @@ def list_all(client, method: str, **kwargs) -> list:
     return oci.pagination.list_call_get_all_results(fn, **kwargs).data
 
 
-def flatten(value, prefix="", out=None) -> dict:
-    """Flatten nested dicts to dotted keys; lists become JSON strings."""
-    if out is None:
-        out = {}
-    if isinstance(value, dict):
-        for k, v in value.items():
-            flatten(v, f"{prefix}.{k}" if prefix else str(k), out)
-    elif isinstance(value, (list, tuple)):
-        out[prefix] = json.dumps(value, default=str) if value else ""
-    else:
-        out[prefix] = "" if value is None else value
-    return out
+def pick(data, path: str):
+    """Read a dotted attribute path; lists are walked and joined ("a, b")."""
+    values = [data]
+    for part in path.split("."):
+        nxt = []
+        for v in values:
+            if isinstance(v, list):
+                nxt += [i.get(part) if isinstance(i, dict) else None for i in v]
+            elif isinstance(v, dict):
+                nxt.append(v.get(part))
+        values = nxt
+    flat = []
+    for v in values:
+        flat += v if isinstance(v, list) else [v]
+    flat = [v for v in flat if v not in (None, "", {})]
+    if not flat:
+        return ""
+    if len(flat) == 1 and not isinstance(flat[0], (dict, list)):
+        return flat[0]
+    return ", ".join(json.dumps(v, default=str) if isinstance(v, (dict, list)) else str(v) for v in flat)
 
 
 def to_json(value) -> str:
     return json.dumps(value, default=str, sort_keys=True) if value else ""
 
 
-def build_row(item, spec, region, comp, parent_id="") -> dict:
+def build_row(item, spec, region, comp, with_tags: bool) -> dict:
     data = oci.util.to_dict(item)
     if not isinstance(data, dict):
-        data = {"value": data}
-    shape = data.get("shape") or data.get("node_shape") or data.get("db_system_shape") or data.get("shape_name")
+        data = {}
+    shape = (data.get("shape") or data.get("shape_name") or data.get("node_shape")
+             or data.get("dedicated_vm_host_shape") or data.get("storage_tier") or "")
     row = {
         "Region": region,
-        "Category": spec["category"],
+        "Compartment": comp["path"],
         "Service": spec["service"],
         "Resource Type": spec["type"],
-        "Compartment Name": comp["name"],
-        "Compartment Path": comp["path"],
-        "Name": data.get("display_name") or data.get("name") or data.get("db_name") or data.get("email_address") or "",
-        "OCID": data.get("id") or "",
-        "Lifecycle State": data.get("lifecycle_state") or data.get("state") or data.get("status") or "",
-        "Availability Domain": data.get("availability_domain") or "",
+        "Name": data.get("display_name") or data.get("name") or "",
+        # A listed resource with no lifecycle state (e.g. a bucket) simply exists.
+        "Status": data.get("lifecycle_state") or "ACTIVE",
         "Shape": shape if isinstance(shape, str) else "",
-        "Time Created": data.get("time_created") or "",
-        "Parent OCID": parent_id,
-        "Freeform Tags": to_json(data.get("freeform_tags")),
-        "Defined Tags": to_json(data.get("defined_tags")),
+        "Availability Domain": data.get("availability_domain") or "",
+        "Created": str(data.get("time_created") or ""),
+        "OCID": data.get("id") or "",
+        "_compartment_id": data.get("compartment_id") or "",
+        "_data": data,
     }
-    detail = flatten({k: v for k, v in data.items() if k not in ("freeform_tags", "defined_tags", "system_tags")})
-    for k, v in detail.items():
-        if k.endswith("user_data"):  # cloud-init scripts can embed secrets
-            continue
-        row.setdefault(f"attr.{k}", v)
-    row["_compartment_id"] = data.get("compartment_id") or ""
+    for column, path in spec["fields"]:
+        row[column] = pick(data, path)
+    if with_tags:
+        row["Freeform Tags"] = to_json(data.get("freeform_tags"))
+        row["Defined Tags"] = to_json(data.get("defined_tags"))
     return row
-
-
-def keep(row, include_deleted: bool) -> bool:
-    return include_deleted or str(row["Lifecycle State"]).upper() not in SKIP_STATES
 
 
 def safe_name(text: str) -> str:
@@ -412,18 +402,16 @@ def get_regions(identity, tenancy_id: str, only: list[str] | None) -> tuple[list
 # ---------------------------------------------------------------------------
 
 
-def collect_task(inv: Inventory, spec, region, comp, ctx, include_deleted) -> int:
-    """List one resource type in one compartment/region (and its children)."""
-    key = (spec["category"], spec["service"], spec["type"])
+def collect_task(inv: Inventory, spec, region, comp, ctx, args) -> int:
+    """List one resource type in one compartment of one region."""
     try:
         client = inv.client(spec["client"], region)
         kwargs = dict(spec["kwargs"])
-        scope = spec["scope"]
         items = []
-        if scope == "ad":
+        if spec["scope"] == "ad":
             for ad in ctx["ads"].get(region, []):
                 items += list_all(client, spec["method"], compartment_id=comp["id"], availability_domain=ad, **kwargs)
-        elif scope == "ns":
+        elif spec["scope"] == "ns":
             items = list_all(client, spec["method"], namespace_name=ctx["namespace"], compartment_id=comp["id"],
                              **kwargs)
         else:
@@ -432,81 +420,25 @@ def collect_task(inv: Inventory, spec, region, comp, ctx, include_deleted) -> in
         inv.error(region, spec["type"], comp["path"], exc)
         return 0
 
-    rows = []
+    fields = [c for c, _ in spec["fields"]]
+    grouped = defaultdict(list)
     for item in items:
-        row = build_row(item, spec, region if not spec["home_only"] else f"{region} (global)", comp)
-        # Some list APIs (e.g. images) also return objects from other compartments.
-        if row["_compartment_id"] and row["_compartment_id"] != comp["id"] and spec["type"] != "Compartment":
+        row = build_row(item, spec, region, comp, args.tags)
+        # Only resources that live in this compartment (some APIs also return
+        # objects from elsewhere), and only ones that are actually provisioned.
+        if row["_compartment_id"] and row["_compartment_id"] != comp["id"]:
             continue
-        if keep(row, include_deleted):
-            rows.append(row)
-    if spec["subtype"]:
-        field, names = spec["subtype"]
-        grouped = defaultdict(list)
-        for row in rows:
-            value = row.get(f"attr.{field}") or ""
+        if not args.include_deleted and str(row["Status"]).upper() in SKIP_STATES:
+            continue
+        if spec["subtype"]:
+            attr, names = spec["subtype"]
+            value = row["_data"].get(attr) or ""
             row["Resource Type"] = names.get(value, f"{spec['type']} ({value or 'unknown'})")
-            grouped[row["Resource Type"]].append(row)
-        for rtype, group in grouped.items():
-            inv.add((spec["category"], spec["service"], rtype), group)
-    else:
-        inv.add(key, rows)
-    count = len(rows)
+        grouped[row["Resource Type"]].append(row)
 
-    for child in spec["children"]:
-        child_spec = dict(spec, type=child["type"], children=[])
-        child_key = (spec["category"], spec["service"], child["type"])
-        child_client = inv.client(child["client"], region)
-        for parent in rows:
-            fields = {"id": parent["OCID"], "compartment_id": comp["id"]}
-            kwargs = {k: v.format(**fields) for k, v in child["kwargs"].items()}
-            try:
-                child_items = list_all(child_client, child["method"], **kwargs)
-            except Exception as exc:  # noqa: BLE001
-                inv.error(region, child["type"], comp["path"], exc)
-                continue
-            child_rows = [build_row(i, child_spec, parent["Region"], comp, parent_id=parent["OCID"])
-                          for i in child_items]
-            child_rows = [r for r in child_rows if keep(r, include_deleted)]
-            inv.add(child_key, child_rows)
-            count += len(child_rows)
-    return count
-
-
-def resource_search(inv: Inventory, regions, comps_by_id, include_deleted) -> list[dict]:
-    """Cross-check: every resource OCI Resource Search knows about, per region."""
-    details = oci.resource_search.models.StructuredSearchDetails(
-        type="Structured", query="query all resources", matching_context_type="NONE")
-    rows = []
-    for region in regions:
-        try:
-            client = inv.client("resource_search.ResourceSearchClient", region)
-            items = list_all(client, "search_resources", search_details=details)
-        except Exception as exc:  # noqa: BLE001
-            inv.error(region, "Resource Search", "", exc)
-            continue
-        for i in items:
-            state = (i.lifecycle_state or "").upper()
-            if not include_deleted and state in SKIP_STATES:
-                continue
-            comp = comps_by_id.get(i.compartment_id)
-            if comps_by_id and i.compartment_id and comp is None:
-                continue  # outside the selected compartment tree
-            rows.append({
-                "Region": region,
-                "Resource Type": i.resource_type,
-                "Name": i.display_name or "",
-                "OCID": i.identifier,
-                "Lifecycle State": i.lifecycle_state or "",
-                "Availability Domain": i.availability_domain or "",
-                "Compartment Name": comp["name"] if comp else "",
-                "Compartment Path": comp["path"] if comp else "",
-                "Time Created": i.time_created or "",
-                "Freeform Tags": to_json(i.freeform_tags),
-                "Defined Tags": to_json(i.defined_tags),
-            })
-        log.info("Resource Search %-20s %6d resources", region, sum(1 for r in rows if r["Region"] == region))
-    return rows
+    for rtype, rows in grouped.items():
+        inv.add((spec["category"], spec["service"], rtype), rows, fields)
+    return sum(len(r) for r in grouped.values())
 
 
 # ---------------------------------------------------------------------------
@@ -548,7 +480,6 @@ class SheetNamer:
 # Resource types whose names exceed Excel's 31-character sheet-name limit.
 SHEET_ALIASES = {
     "Autonomous Transaction Processing (ATP)": "Autonomous Transaction (ATP)",
-    "Exadata Database Service VM Cluster": "ExaDB VM Cluster",
 }
 
 HEADER_FONT = Font(bold=True, color="FFFFFF")
@@ -596,46 +527,44 @@ def _col_letter(n: int) -> str:
     return letters
 
 
-def write_workbook(inv: Inventory, path: Path, search_rows: list[dict] | None, meta: dict) -> None:
+def write_workbook(inv: Inventory, path: Path, meta: dict, with_tags: bool) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     namer = SheetNamer()
-    for reserved in ("Summary", "All Resources", "Resource Search", "Errors", "Run Info"):
+    for reserved in ("Summary", "All Resources", "Errors", "Run Info"):
         namer(reserved)
+    tags = TAG_COLUMNS if with_tags else []
 
-    all_rows, summary, type_sheets = [], Counter(), []
-    sheet_for_type = {}
-    order = sorted((k for k, v in inv.rows.items() if v), key=lambda k: (k[0], k[1], k[2]))
-    for category, service, rtype in order:
-        rows = inv.rows[(category, service, rtype)]
-        all_rows.extend(rows)
+    all_rows, summary, type_sheets, sheet_for_type = [], Counter(), [], {}
+    for key in sorted(k for k, v in inv.rows.items() if v):
+        category, service, rtype = key
+        rows = sorted(inv.rows[key], key=lambda r: (r["Region"], r["Compartment"], str(r["Name"]).lower()))
+        fields = inv.fields[key]
         for r in rows:
-            summary[(r["Region"], category, service, rtype)] += 1
+            summary[(category, service, rtype, r["Region"])] += 1
+            r["Key Details"] = "; ".join(f"{f}: {r[f]}" for f in fields if r.get(f) not in ("", None))
+        all_rows.extend(rows)
         sheet = namer(SHEET_ALIASES.get(rtype, rtype))
         sheet_for_type[rtype] = sheet
-        extra = sorted({k for r in rows for k in r if k.startswith("attr.")})
-        type_sheets.append((sheet, rows, COMMON_COLUMNS + extra))
+        # Sheet column order: identity, then the type's key fields, then the rest.
+        columns = BASE_COLUMNS[:7] + fields + BASE_COLUMNS[7:] + tags
+        type_sheets.append((sheet, rows, columns))
 
-    summary_rows = [{"Region": k[0], "Category": k[1], "Service": k[2], "Resource Type": k[3], "Count": v,
-                     "Sheet": sheet_for_type[k[3]]} for k, v in sorted(summary.items())]
+    summary_rows = [{"Category": k[0], "Service": k[1], "Resource Type": k[2], "Region": k[3], "Count": v,
+                     "Sheet": sheet_for_type[k[2]]} for k, v in sorted(summary.items())]
     info_rows = [{"Setting": k, "Value": v} for k, v in meta.items()]
-    info_rows.append({"Setting": "Total Resources", "Value": len(all_rows)})
+    info_rows.append({"Setting": "Total Provisioned Resources", "Value": len(all_rows)})
     info_rows.append({"Setting": "Errors / Skipped Calls", "Value": len(inv.errors)})
 
     wb = Workbook(write_only=True)
-    add_sheet(wb, "Summary", summary_rows,
-              ["Region", "Category", "Service", "Resource Type", "Count", "Sheet"],
+    add_sheet(wb, "Summary", summary_rows, ["Category", "Service", "Resource Type", "Region", "Count", "Sheet"],
               links={"Sheet": {s: s for s in sheet_for_type.values()}})
-    add_sheet(wb, "All Resources", all_rows, COMMON_COLUMNS)
+    add_sheet(wb, "All Resources", all_rows, BASE_COLUMNS[:7] + ["Key Details"] + BASE_COLUMNS[7:] + tags)
     for sheet, rows, columns in type_sheets:
         add_sheet(wb, sheet, rows, columns)
-    if search_rows is not None:
-        add_sheet(wb, "Resource Search", search_rows,
-                  ["Region", "Resource Type", "Name", "OCID", "Lifecycle State", "Availability Domain",
-                   "Compartment Name", "Compartment Path", "Time Created", "Freeform Tags", "Defined Tags"])
     add_sheet(wb, "Errors", inv.errors, ["Region", "Resource Type", "Compartment", "Status", "Code", "Message"])
     add_sheet(wb, "Run Info", info_rows, ["Setting", "Value"])
     wb.save(path)
-    log.info("Total resources: %d   (%d resource types)", len(all_rows), len(type_sheets))
+    log.info("Total provisioned resources: %d   (%d resource types)", len(all_rows), len(type_sheets))
 
 
 # ---------------------------------------------------------------------------
@@ -644,16 +573,18 @@ def write_workbook(inv: Inventory, path: Path, search_rows: list[dict] | None, m
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Export OCI IaaS & PaaS inventory for all regions to one Excel workbook (read-only).")
+    p = argparse.ArgumentParser(
+        description="Export provisioned OCI IaaS & PaaS resources for all regions to one Excel workbook (read-only).")
     p.add_argument("--config-file", default=os.getenv("OCI_CLI_CONFIG_FILE", oci.config.DEFAULT_LOCATION),
                    help="OCI config file (default: ~/.oci/config)")
     p.add_argument("--profile", default=os.getenv("OCI_CLI_PROFILE", "DEFAULT"), help="OCI config profile")
     p.add_argument("--regions", help="Comma-separated regions to scan (default: all subscribed regions)")
     p.add_argument("--compartment", help="Only scan this compartment OCID and its sub-compartments")
-    p.add_argument("--output-dir", default="./output", help="Base output directory (default: ./output)")
+    p.add_argument("--output-dir", default="./output", help="Output directory (default: ./output)")
     p.add_argument("--workers", type=int, default=10, help="Parallel API workers (default: 10)")
-    p.add_argument("--include-deleted", action="store_true", help="Also export TERMINATED/DELETED resources")
-    p.add_argument("--no-search", action="store_true", help="Skip the OCI Resource Search cross-check sheet")
+    p.add_argument("--tags", action="store_true", help="Add Freeform / Defined tag columns")
+    p.add_argument("--include-deleted", action="store_true",
+                   help="Also export TERMINATED / DELETED / FAILED resources")
     p.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
     return p.parse_args()
 
@@ -690,23 +621,14 @@ def main() -> None:
         except Exception as exc:  # noqa: BLE001
             inv.error(region, "Availability Domains", "", exc)
 
-    tasks = []
-    root = [c for c in comps if c["id"] == tenancy_id]  # empty when --compartment is used
-    for spec in RESOURCES:
-        if spec["scope"] == "ns" and not ctx["namespace"]:
-            continue
-        spec_regions = [home] if spec["home_only"] else regions
-        spec_comps = root if spec["scope"] == "tenancy" else comps
-        for region in spec_regions:
-            for comp in spec_comps:
-                tasks.append((spec, region, comp))
+    tasks = [(spec, region, comp) for spec in RESOURCES if spec["scope"] != "ns" or ctx["namespace"]
+             for region in regions for comp in comps]
 
     log.info("Running %d list operations with %d workers ...", len(tasks), args.workers)
     started = time.time()
     done = 0
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-        futures = {pool.submit(collect_task, inv, s, r, c, ctx, args.include_deleted): (s, r, c)
-                   for s, r, c in tasks}
+        futures = {pool.submit(collect_task, inv, s, r, c, ctx, args): (s, r, c) for s, r, c in tasks}
         for fut in as_completed(futures):
             done += 1
             spec, region, comp = futures[fut]
@@ -716,19 +638,15 @@ def main() -> None:
             if done % 250 == 0 or done == len(tasks):
                 log.info("Progress: %d/%d operations (%.0fs)", done, len(tasks), time.time() - started)
 
-    search_rows = None
-    if not args.no_search:
-        comps_by_id = {c["id"]: c for c in comps}
-        search_rows = resource_search(inv, regions, comps_by_id, args.include_deleted)
-
     started_at = datetime.now()
     path = Path(args.output_dir) / f"OCI_Inventory_{safe_name(args.profile)}_{started_at:%Y%m%d_%H%M%S}.xlsx"
     meta = {
         "Tenancy": tenancy_id, "Profile": args.profile, "Home Region": home,
         "Regions Scanned": ", ".join(regions), "Compartments Scanned": len(comps),
         "Generated": f"{started_at:%Y-%m-%d %H:%M:%S}",
+        "Included": "Provisioned resources only (running, stopped / powered off, provisioning)",
     }
-    write_workbook(inv, path, search_rows, meta)
+    write_workbook(inv, path, meta, args.tags)
     log.info("Errors / skipped calls: %d (see the 'Errors' sheet)", len(inv.errors))
     log.info("Excel workbook written to: %s", path.resolve())
 

@@ -102,47 +102,44 @@ Additional overrides:
 
 ## Multi-region Excel export (`oci_inventory_excel.py`)
 
-A standalone script that inventories **all subscribed regions** and **all
-accessible compartments** (IaaS and PaaS services) and writes **one Excel
-workbook** with a separate sheet per resource type. It only needs `oci` and
-`openpyxl`, plus your existing OCI CLI / API-key config.
+A standalone script that lists the **provisioned** IaaS and PaaS resources in
+**all subscribed regions** and **all accessible compartments** and writes
+**one Excel workbook** with a sheet per resource type. Running, stopped /
+powered-off and provisioning resources are included; terminated, deleted and
+failed ones are not. Configuration objects (route tables, security lists,
+attachments, IAM policies, users, alarms, ...) are left out.
 
 ```bash
 pip install oci openpyxl
-python3 oci_inventory_excel.py                                # everything
-python3 oci_inventory_excel.py --profile PROD --workers 16
+python3 oci_inventory_excel.py --profile <profile>
 python3 oci_inventory_excel.py --regions us-ashburn-1,uk-london-1
 python3 oci_inventory_excel.py --compartment ocid1.compartment.oc1..<id>
+python3 oci_inventory_excel.py --tags            # add tag columns
 ```
 
 Output: `./output/OCI_Inventory_<profile>_<timestamp>.xlsx` with sheets:
 
-- `Summary` — counts per region / service / type, with a link to each sheet
-- `All Resources` — every resource, common columns (region, service, type,
-  compartment path, name, OCID, state, shape, tags, ...)
-- one sheet per resource type (Instance, VCN, ATP, ADW, OAC, ...) with all
-  API attributes flattened into columns
-- `Resource Search` — OCI Resource Search cross-check
-  (disable with `--no-search`)
+- `Summary` — count per resource type and region, with a link to each sheet
+- `All Resources` — every provisioned resource with a "Key Details" column
+- one sheet per resource type with only its key columns, e.g. Instance
+  (shape, OCPUs, memory), Block Volume (size, VPUs), ATP / ADW (ECPUs,
+  storage, version, license), OAC (edition, capacity), OKE Node Pool (nodes,
+  OCPUs/memory per node)
 - `Errors` — calls that failed (missing permissions, service not available
   in a region, ...)
 - `Run Info` — tenancy, profile, regions scanned, timestamp and totals
 
-Every sheet has a bold header row, frozen panes, auto filter and sized
-columns.
-
-Covered services include Compute, Block/File/Object Storage, Networking
-(VCN, subnets, gateways, DRG, VPN, FastConnect, LB/NLB, DNS, Network
-Firewall), WAF, Vault, Certificates, Bastion, Logging/Monitoring/
-Notifications/Events, IAM, Oracle Database (DB Systems, Exadata, Autonomous
-ATP / ADW / AJD / APEX as separate types),
+Covered: Compute (instances, dedicated hosts, instance pools, cluster
+networks), Block / File / Object Storage, Networking (VCN, subnets,
+gateways, DRG, remote peering, reserved public IPs, Site-to-Site VPN,
+FastConnect, LB / NLB, DNS zones, Network Firewall), WAF, Vault, Bastion,
+Oracle Database (DB Systems, Exadata, Autonomous ATP / ADW / AJD / APEX),
 MySQL HeatWave, PostgreSQL, NoSQL, Redis, OpenSearch, GoldenGate, OKE,
-Container Instances, Container/Artifact Registry, Functions, API Gateway,
-Integration, Visual Builder, Oracle Analytics Cloud (OAC), Digital Assistant, Data Science,
-Data Flow, Data Integration, Data Catalog, Big Data, Generative AI,
-Streaming, Queue, Email Delivery, Blockchain, APM, DevOps and Resource
-Manager. Terminated/deleted resources are skipped unless
-`--include-deleted` is given. The read-only policy
+Container Instances, Functions, API Gateway, Integration, Visual Builder,
+Oracle Analytics Cloud (OAC), Digital Assistant, Data Science, Data Flow,
+Data Integration, Data Catalog, Big Data, Generative AI (dedicated AI
+clusters, endpoints, agents, knowledge bases), Streaming, Queue, Blockchain
+and APM. The read-only policy
 `Allow group <group> to read all-resources in tenancy` covers everything.
 
 ## Cloud Shell
