@@ -42,7 +42,7 @@ import sys
 import threading
 import time
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
 
@@ -64,6 +64,16 @@ log = logging.getLogger("oci_inventory")
 SKIP_STATES = {"TERMINATED", "TERMINATING", "DELETED", "DELETING", "FAILED"}
 MAX_CELL_LEN = 32000  # stay under Excel's 32,767 character cell limit
 MAX_ROWS = 1_048_575  # Excel row limit minus the header row
+
+# The SDK default retries a failing call for up to 10 minutes. Some services
+# have no endpoint in some regions, so fail fast instead: 3 attempts, 60s max.
+RETRY_STRATEGY = oci.retry.RetryStrategyBuilder(
+    max_attempts_check=True, max_attempts=3,
+    total_elapsed_time_check=True, total_elapsed_time_seconds=60,
+    retry_max_wait_between_calls_seconds=5,
+    service_error_check=True,
+).get_retry_strategy()
+TIMEOUT = (5, 60)  # (connect, read) seconds
 
 # ---------------------------------------------------------------------------
 # Resource catalogue - provisioned resources only
@@ -252,6 +262,9 @@ class Inventory:
         self.rows: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
         self.fields: dict[tuple[str, str, str], list[str]] = {}
         self.errors: list[dict] = []
+        self.unreachable: set[tuple[str, str]] = set()  # (client, region) with no reachable endpoint
+        self.probed: set[tuple[str, str]] = set()       # (client, region) whose first call has returned
+        self._probe_locks: dict[tuple[str, str], threading.Lock] = defaultdict(threading.Lock)
         self._lock = threading.Lock()
         self._local = threading.local()
 
@@ -264,8 +277,12 @@ class Inventory:
             module_name, class_name = path.split(".")
             cls = getattr(getattr(oci, module_name), class_name)
             cfg = dict(self.config, region=region)
-            cache[key] = cls(cfg, retry_strategy=oci.retry.DEFAULT_RETRY_STRATEGY, timeout=self.timeout)
+            cache[key] = cls(cfg, retry_strategy=RETRY_STRATEGY, timeout=self.timeout)
         return cache[key]
+
+    def probe_lock(self, key) -> threading.Lock:
+        with self._lock:
+            return self._probe_locks[key]
 
     def add(self, key, rows, fields):
         with self._lock:
@@ -404,20 +421,46 @@ def get_regions(identity, tenancy_id: str, only: list[str] | None) -> tuple[list
 
 def collect_task(inv: Inventory, spec, region, comp, ctx, args) -> int:
     """List one resource type in one compartment of one region."""
-    try:
+    key = (spec["client"], region)
+
+    def fetch():
         client = inv.client(spec["client"], region)
         kwargs = dict(spec["kwargs"])
-        items = []
         if spec["scope"] == "ad":
+            items = []
             for ad in ctx["ads"].get(region, []):
                 items += list_all(client, spec["method"], compartment_id=comp["id"], availability_domain=ad, **kwargs)
-        elif spec["scope"] == "ns":
-            items = list_all(client, spec["method"], namespace_name=ctx["namespace"], compartment_id=comp["id"],
-                             **kwargs)
+            return items
+        if spec["scope"] == "ns":
+            return list_all(client, spec["method"], namespace_name=ctx["namespace"], compartment_id=comp["id"],
+                            **kwargs)
+        return list_all(client, spec["method"], compartment_id=comp["id"], **kwargs)
+
+    try:
+        if key in inv.unreachable:
+            return 0  # endpoint already found unreachable in this region; reported once
+        if key in inv.probed:
+            items = fetch()
         else:
-            items = list_all(client, spec["method"], compartment_id=comp["id"], **kwargs)
-    except Exception as exc:  # noqa: BLE001 - one failure must never stop the run
+            # The first call to a service in a region runs alone, so an
+            # unreachable endpoint costs one failed call, not one per compartment.
+            with inv.probe_lock(key):
+                if key in inv.unreachable:
+                    return 0
+                try:
+                    items = fetch()
+                finally:
+                    inv.probed.add(key)
+    except oci.exceptions.ServiceError as exc:
         inv.error(region, spec["type"], comp["path"], exc)
+        return 0
+    except Exception as exc:  # noqa: BLE001 - one failure must never stop the run
+        # Connection / DNS / timeout errors: the service is not reachable in this
+        # region, so skip it for every other compartment too.
+        if key not in inv.unreachable:
+            inv.unreachable.add(key)
+            inv.error(region, spec["type"], "(all compartments)",
+                      RuntimeError(f"Service endpoint not reachable in {region}; skipped: {exc}"))
         return 0
 
     fields = [c for c, _ in spec["fields"]]
@@ -599,7 +642,7 @@ def main() -> None:
     config = oci.config.from_file(os.path.expanduser(args.config_file), args.profile)
     oci.config.validate_config(config)
     tenancy_id = config["tenancy"]
-    inv = Inventory(config, timeout=(10, 120))
+    inv = Inventory(config, timeout=TIMEOUT)
 
     identity = inv.client("identity.IdentityClient", config["region"])
     regions, home = get_regions(identity, tenancy_id, args.regions.split(",") if args.regions else None)
@@ -625,18 +668,27 @@ def main() -> None:
              for region in regions for comp in comps]
 
     log.info("Running %d list operations with %d workers ...", len(tasks), args.workers)
-    started = time.time()
+    started = last_log = time.time()
     done = 0
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
         futures = {pool.submit(collect_task, inv, s, r, c, ctx, args): (s, r, c) for s, r, c in tasks}
-        for fut in as_completed(futures):
-            done += 1
-            spec, region, comp = futures[fut]
-            found = fut.result()
-            if found:
-                log.debug("%-16s %-35s %-40s %d", region, spec["type"], comp["path"], found)
-            if done % 250 == 0 or done == len(tasks):
-                log.info("Progress: %d/%d operations (%.0fs)", done, len(tasks), time.time() - started)
+        pending = set(futures)
+        while pending:
+            finished, pending = wait(pending, timeout=30, return_when=FIRST_COMPLETED)
+            for fut in finished:
+                done += 1
+                spec, region, comp = futures[fut]
+                found = fut.result()
+                if found:
+                    log.debug("%-16s %-35s %-40s %d", region, spec["type"], comp["path"], found)
+                if done % 250 == 0 or done == len(tasks):
+                    log.info("Progress: %d/%d operations (%.0fs)", done, len(tasks), time.time() - started)
+                    last_log = time.time()
+            if pending and time.time() - last_log >= 30:
+                running = [futures[f] for f in pending if f.running()][:5]
+                log.info("Progress: %d/%d operations (%.0fs) - waiting on: %s", done, len(tasks),
+                         time.time() - started, "; ".join(f"{s['type']} @ {r}" for s, r, _ in running))
+                last_log = time.time()
 
     started_at = datetime.now()
     path = Path(args.output_dir) / f"OCI_Inventory_{safe_name(args.profile)}_{started_at:%Y%m%d_%H%M%S}.xlsx"
